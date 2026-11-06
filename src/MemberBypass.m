@@ -1,13 +1,18 @@
-// MemberBypass.m v5 — 弹窗修复版
+// MemberBypass.m v6 — 修正 Codable 键名
 //
-// v4 没弹窗的原因：iOS 13+ UIScene 架构下
-//   [UIApplication sharedApplication].windows  返回空数组
-// 所以 window 拿不到，presentViewController 永远不会执行。
+// v5 弹窗证明：
+//   dylib 已加载 ✅ / keychain 写入 status=0 ✅ / 读回 isVIP:true ✅
+//   但 app 仍显示免费用户 ❌
 //
-// v5 修复：
-//   1. 遍历 connectedScenes 找 keyWindow
-//   2. 都失败时，直接用 UIWindow 手工建一个和 app 同级的 window 来弹
-//   3. 弹窗失败则退回写文件 + 抄送 NSLog
+// 根因：MemberObj 的存储属性全部带下划线（@Published 包装），
+//       Codable 合成的 CodingKey 用的就是存储属性名：
+//         id, _isVIP, _expireAt, _VIPType, _hasGifted,
+//         _shouldRefreshProducts, _weeklyReadNum
+//       v5 写的是 isVIP/expireAt/VIPType，解码时全部对不上，
+//       但 JSONDecoder 对缺字段报错后 app 静默回落到免费用户。
+//
+// v6：只写正确的键名（干净 JSON，不塞多余字段）
+//     并且把 hook 的匹配放宽到任意 keychain 读取
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -22,32 +27,26 @@
 
 static BOOL g_done = NO;
 static NSMutableArray<NSString *> *g_lines = nil;
-
 #define ADD(fmt, ...) [g_lines addObject:[NSString stringWithFormat:(fmt), ##__VA_ARGS__]]
 
 #pragma mark - keychain
 
 static NSDictionary *Q(NSString *svc, NSString *acc) {
-    return @{
-        (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: svc,
-        (__bridge id)kSecAttrAccount: acc,
-    };
+    return @{ (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+              (__bridge id)kSecAttrService: svc,
+              (__bridge id)kSecAttrAccount: acc };
 }
 
 static NSString *ReadKC(NSString *svc, NSString *acc) {
     NSMutableDictionary *q = [Q(svc, acc) mutableCopy];
     q[(__bridge id)kSecReturnData] = @YES;
     q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
-    CFTypeRef out = NULL;
-    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &out);
-    if (st != errSecSuccess || !out) return [NSString stringWithFormat:@"无(status=%d)", (int)st];
-    NSData *d = (__bridge_transfer NSData *)out;
+    CFTypeRef o = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &o);
+    if (st != errSecSuccess || !o) return [NSString stringWithFormat:@"(st=%d)", (int)st];
+    NSData *d = (__bridge_transfer NSData *)o;
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    if (s.length) return [NSString stringWithFormat:@"%luB %@", (unsigned long)d.length,
-                          [s substringToIndex:MIN((NSUInteger)100, s.length)]];
-    return [NSString stringWithFormat:@"%luB <非UTF8: %@>", (unsigned long)d.length,
-            [d subdataWithRange:NSMakeRange(0, MIN(16u, (unsigned)d.length))]];
+    return s ?: [NSString stringWithFormat:@"%luB non-utf8", (unsigned long)d.length];
 }
 
 static OSStatus WriteKC(NSString *svc, NSString *acc, NSData *p) {
@@ -58,21 +57,40 @@ static OSStatus WriteKC(NSString *svc, NSString *acc, NSData *p) {
     return SecItemAdd((__bridge CFDictionaryRef)a, NULL);
 }
 
-#pragma mark - hook
+#pragma mark - payload：严格按 Swift 存储属性名
 
-typedef OSStatus (*CopyMatchingFn)(CFDictionaryRef, CFTypeRef *);
-static CopyMatchingFn g_orig = NULL;
+static NSData *BuildPayload(void) {
+    // 键名 = MemberObj 的存储属性名（含下划线）
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"id"]                     = @"local";
+    d[@"_isVIP"]                 = @YES;
+    d[@"_expireAt"]              = @9021715200.0;   // 2286-11-21
+    d[@"_VIPType"]               = @2;
+    d[@"_hasGifted"]             = @NO;
+    d[@"_shouldRefreshProducts"] = @NO;
+    d[@"_weeklyReadNum"]         = @0;
+    NSError *e = nil;
+    NSData *out = [NSJSONSerialization dataWithJSONObject:d options:0 error:&e];
+    if (e) ADD(@"payload err %@", e);
+    return out;
+}
+
+#pragma mark - hooks
+
+typedef OSStatus (*CopyFn)(CFDictionaryRef, CFTypeRef *);
+static CopyFn g_orig = NULL;
 static NSData *g_payload = nil;
 static int g_hits = 0;
 
 static OSStatus MB_Copy(CFDictionaryRef q, CFTypeRef *r) {
+    // 放宽：任何带 ReturnData 的 keychain 读，只要 account 不含已知噪声就拦
     if (q && g_payload) {
         NSDictionary *d = (__bridge NSDictionary *)q;
         NSString *acc = d[(__bridge id)kSecAttrAccount];
         BOOL wantData = [d[(__bridge id)kSecReturnData] boolValue];
-        if ([acc isKindOfClass:[NSString class]] && wantData &&
-            ([acc.lowercaseString containsString:@"transaction"] ||
-             [acc.lowercaseString containsString:@"member"])) {
+        id limit = d[(__bridge id)kSecMatchLimit];
+        BOOL all = [limit isEqual:(__bridge id)kSecMatchLimitAll];
+        if ([acc isKindOfClass:[NSString class]] && wantData && !all) {
             g_hits++;
             if (r) *r = CFBridgingRetain(g_payload);
             return errSecSuccess;
@@ -118,94 +136,52 @@ static void PatchGOT(const char *sym, void *repl, void **origOut) {
             lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
         }
     }
-    ADD(@"hook %s: %d 处", sym, n);
+    ADD(@"hook %s: %d", sym, n);
 }
 
-#pragma mark - 正确的取窗口（iOS 13+）
+#pragma mark - alert
 
-static UIWindow *MBKeyWindow(void) {
-    UIWindow *fallback = nil;
-
-    // 1) connectedScenes 路线
+static UIWindow *KeyWindow(void) {
+    UIWindow *fb = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
             if (![sc isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *ws = (UIWindowScene *)sc;
             for (UIWindow *w in ws.windows) {
                 if (w.isKeyWindow) return w;
-                if (!fallback) fallback = w;
+                if (!fb) fb = w;
             }
-            if (!fallback && ws.windows.count) fallback = ws.windows.firstObject;
+            if (!fb && ws.windows.count) fb = ws.windows.firstObject;
         }
     }
-
-    // 2) 老 API
-    if (!fallback) {
+    if (!fb) {
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             if (w.isKeyWindow) return w;
-            if (!fallback) fallback = w;
+            if (!fb) fb = w;
         }
     }
-
-    // 3) 都空：手工建一个
-    if (!fallback && @available(iOS 13.0, *)) {
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)sc;
-            UIWindow *w = [[UIWindow alloc] initWithWindowScene:ws];
-            w.windowLevel = UIWindowLevelAlert + 1;
-            w.frame = ws.coordinateSpace.bounds;
-            w.hidden = NO;
-            w.rootViewController = [[UIViewController alloc] init];
-            fallback = w;
-            ADD(@"(手工创建 window)");
-            break;
-        }
-    }
-    return fallback;
+    return fb;
 }
 
 static void ShowAlert(int attempt) {
-    UIWindow *win = MBKeyWindow();
-    UIViewController *root = win.rootViewController;
-
-    if (!root) {
-        if (attempt < 20) {
+    UIWindow *win = KeyWindow();
+    UIViewController *vc = win.rootViewController;
+    if (!vc) {
+        if (attempt < 15) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ ShowAlert(attempt + 1); });
         }
         return;
     }
-
-    // root 可能已经 present 了别的东西，逐层找最顶层
-    UIViewController *top = root;
+    UIViewController *top = vc;
     while (top.presentedViewController) top = top.presentedViewController;
 
-    NSString *body = [g_lines componentsJoinedByString:@"\n"];
     UIAlertController *ac =
-        [UIAlertController alertControllerWithTitle:@"MemberBypass 诊断"
-                                            message:body
+        [UIAlertController alertControllerWithTitle:@"MemberBypass v6"
+                                            message:[g_lines componentsJoinedByString:@"\n"]
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"知道了"
-                                           style:UIAlertActionStyleDefault
-                                         handler:nil]];
-
-    [top presentViewController:ac animated:YES completion:^{
-        NSLog(@"[MB] alert presented");
-    }];
-    NSLog(@"[MB] alert attempted on %@", NSStringFromClass([top class]));
-}
-
-#pragma mark - 落盘兜底
-
-static void DumpToFile(void) {
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                         NSUserDomainMask, YES) firstObject];
-    if (!dir) return;
-    NSString *p = [dir stringByAppendingPathComponent:@"mb.log"];
-    NSString *txt = [g_lines componentsJoinedByString:@"\n"];
-    [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSLog(@"[MB] log -> %@", p);
+    [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+    [top presentViewController:ac animated:YES completion:nil];
 }
 
 #pragma mark - init
@@ -215,40 +191,21 @@ static void MBInitOnce(void) {
     g_done = YES;
     g_lines = [NSMutableArray array];
 
-    ADD(@"✅ dylib 已加载");
-    ADD(@"bundle: %@", [[NSBundle mainBundle] bundleIdentifier]);
-    ADD(@"iOS: %@", [[UIDevice currentDevice] systemVersion]);
+    ADD(@"✅ dylib 已加载 (v6)");
+    g_payload = BuildPayload();
+    ADD(@"payload: %@", [[NSString alloc] initWithData:g_payload encoding:NSUTF8StringEncoding]);
 
-    NSMutableDictionary *p = [NSMutableDictionary dictionary];
-    p[@"id"] = @"local";
-    p[@"isVIP"] = @YES;
-    p[@"expireAt"] = @9021715200.0;
-    p[@"VIPType"] = @2;
-    p[@"hasGifted"] = @NO;
-    p[@"shouldRefreshProducts"] = @NO;
-    p[@"weeklyReadNum"] = @0;
-    g_payload = [NSJSONSerialization dataWithJSONObject:p options:0 error:nil];
-
-    ADD(@"");
-    ADD(@"原始 Keychain:");
-    ADD(@" rainy.lyn.mangaCapsule:");
-    ADD(@"   %@", ReadKC(@"rainy.lyn.mangaCapsule", @"validTransaction"));
+    ADD(@"写入前: %@", ReadKC(@"rainy.lyn.mangaCapsule", @"validTransaction"));
 
     OSStatus w1 = WriteKC(@"rainy.lyn.mangaCapsule", @"validTransaction", g_payload);
     OSStatus w2 = WriteKC(@"rainy.heichai.mangaCapsule3", @"validTransaction", g_payload);
-    ADD(@"");
-    ADD(@"写入: %d / %d", (int)w1, (int)w2);
-    if (w1 == -34018 || w2 == -34018) ADD(@"⚠️ -34018 无 keychain 权限");
-
-    ADD(@"写入后读回:");
-    ADD(@"   %@", ReadKC(@"rainy.lyn.mangaCapsule", @"validTransaction"));
+    OSStatus w3 = WriteKC(@"rainy.lyn.mangaCapsule", @"member", g_payload);
+    ADD(@"写入: %d/%d/%d", (int)w1, (int)w2, (int)w3);
+    ADD(@"写入后: %@", ReadKC(@"rainy.lyn.mangaCapsule", @"validTransaction"));
 
     PatchGOT("SecItemCopyMatching", (void *)MB_Copy, (void **)&g_orig);
-    if (!g_orig) g_orig = (CopyMatchingFn)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
+    if (!g_orig) g_orig = (CopyFn)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
 
-    DumpToFile();
-
-    // app 启动需要时间，延迟弹
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ ShowAlert(0); });
 }
