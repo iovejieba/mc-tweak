@@ -25,51 +25,25 @@ jobs:
           test -d "$SDK/usr/include"
           echo "SDK=$SDK" >> "$GITHUB_ENV"
 
-      - name: Build MemberBypass
+      - name: Build all variants
         run: |
           set -eux
           LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
           printf '#!/bin/bash\nexec %s "$@"\n' "$LD64" > /tmp/ld64wrap
           chmod +x /tmp/ld64wrap
-          clang -arch arm64 -target arm64-apple-ios16.0 \
-            -isysroot "$SDK" \
-            -dynamiclib -fobjc-arc -O2 \
-            -fuse-ld=/tmp/ld64wrap \
-            -Wl,-undefined,dynamic_lookup \
-            -Wl,-platform_version,ios,16.0,16.0 \
-            -framework Foundation -framework UIKit -framework Security \
-            -o MemberBypass.dylib \
-            src/MemberBypass.m src/Constructor.c
-          file MemberBypass.dylib
 
-      - name: Build Tracer
-        run: |
-          set -eux
-          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
-          clang -arch arm64 -target arm64-apple-ios16.0 \
-            -isysroot "$SDK" \
-            -dynamiclib -fobjc-arc -O2 \
-            -fuse-ld="$LD64" \
-            -Wl,-undefined,dynamic_lookup \
-            -Wl,-platform_version,ios,16.0,16.0 \
-            -framework Foundation -framework UIKit \
-            -o Tracer.dylib \
-            src/Tracer.m || true
-          file Tracer.dylib || true
+          CC="clang -arch arm64 -target arm64-apple-ios16.0 -isysroot $SDK \
+              -dynamiclib -fobjc-arc -O2 -fuse-ld=/tmp/ld64wrap \
+              -Wl,-undefined,dynamic_lookup -Wl,-platform_version,ios,16.0,16.0 \
+              -framework Foundation -framework UIKit -framework Security"
 
-      - name: Build Probe
-        run: |
-          set -eux
-          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
-          clang -arch arm64 -target arm64-apple-ios16.0             -isysroot "$SDK"             -dynamiclib -fobjc-arc -O2             -fuse-ld="$LD64"             -Wl,-undefined,dynamic_lookup             -Wl,-platform_version,ios,16.0,16.0             -framework Foundation -framework UIKit             -o Probe.dylib             src/Probe.m || true
-          file Probe.dylib || true
+          # 驼峰键名
+          $CC -DVIPKEY_UNDERSCORE=0 -o MemberBypass_camel.dylib src/MemberBypass.m src/Constructor.c
+          # 下划线键名
+          $CC -DVIPKEY_UNDERSCORE=1 -o MemberBypass_uscore.dylib src/MemberBypass.m src/Constructor.c
 
-      - name: Build Probe2
-        run: |
-          set -eux
-          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
-          clang -arch arm64 -target arm64-apple-ios16.0             -isysroot "$SDK"             -dynamiclib -fobjc-arc -O2             -fuse-ld="$LD64"             -Wl,-undefined,dynamic_lookup             -Wl,-platform_version,ios,16.0,16.0             -framework Foundation -framework UIKit -framework Security             -o Probe2.dylib             src/Probe2.m
-          file Probe2.dylib
+          file MemberBypass_camel.dylib MemberBypass_uscore.dylib
+          ls -la *.dylib
 
       - name: Upload
         if: always()
@@ -77,9 +51,8 @@ jobs:
         with:
           name: dylibs
           path: |
-            MemberBypass.dylib
-            Tracer.dylib
-            Probe.dylib
+            MemberBypass_camel.dylib
+            MemberBypass_uscore.dylib
             Probe2.dylib
           retention-days: 7
           if-no-files-found: warn
