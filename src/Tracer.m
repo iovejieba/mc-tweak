@@ -106,7 +106,8 @@ static void ScanMemberObj(void) {
             mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
             kern_return_t kr = vm_region_recurse_64(mach_task_self(), &addr, &size,
                                                     (natural_t *)&cnt,
-                                                    (vm_region_recurse_info_t)&info);
+                                                    (vm_region_recurse_info_t)&info,
+                                                    NULL);
             if (kr != KERN_SUCCESS) break;
             regions++;
 
