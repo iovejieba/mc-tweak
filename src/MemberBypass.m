@@ -1,7 +1,13 @@
-// MemberBypass.m v4 — 弹窗诊断版
+// MemberBypass.m v5 — 弹窗修复版
 //
-// 目的：不依赖你去翻沙盒日志，启动后直接用 UIAlertView 把关键结果显示出来。
-//      同时保留完整 dylib 注入，确认它到底有没有被 dyld 加载。
+// v4 没弹窗的原因：iOS 13+ UIScene 架构下
+//   [UIApplication sharedApplication].windows  返回空数组
+// 所以 window 拿不到，presentViewController 永远不会执行。
+//
+// v5 修复：
+//   1. 遍历 connectedScenes 找 keyWindow
+//   2. 都失败时，直接用 UIWindow 手工建一个和 app 同级的 window 来弹
+//   3. 弹窗失败则退回写文件 + 抄送 NSLog
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -17,11 +23,9 @@
 static BOOL g_done = NO;
 static NSMutableArray<NSString *> *g_lines = nil;
 
-#define ADD(fmt, ...) do { \
-    [g_lines addObject:[NSString stringWithFormat:(fmt), ##__VA_ARGS__]]; \
-} while (0)
+#define ADD(fmt, ...) [g_lines addObject:[NSString stringWithFormat:(fmt), ##__VA_ARGS__]]
 
-#pragma mark - keychain 探测
+#pragma mark - keychain
 
 static NSDictionary *Q(NSString *svc, NSString *acc) {
     return @{
@@ -31,61 +35,50 @@ static NSDictionary *Q(NSString *svc, NSString *acc) {
     };
 }
 
-static NSString *ReadKeychain(NSString *svc, NSString *acc) {
+static NSString *ReadKC(NSString *svc, NSString *acc) {
     NSMutableDictionary *q = [Q(svc, acc) mutableCopy];
     q[(__bridge id)kSecReturnData] = @YES;
     q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
     CFTypeRef out = NULL;
     OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &out);
-    if (st != errSecSuccess || !out) return [NSString stringWithFormat:@"(status=%d)", (int)st];
+    if (st != errSecSuccess || !out) return [NSString stringWithFormat:@"无(status=%d)", (int)st];
     NSData *d = (__bridge_transfer NSData *)out;
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
     if (s.length) return [NSString stringWithFormat:@"%luB %@", (unsigned long)d.length,
-                          [s substringToIndex:MIN((NSUInteger)120, s.length)]];
-    return [NSString stringWithFormat:@"%luB <非UTF8>", (unsigned long)d.length];
+                          [s substringToIndex:MIN((NSUInteger)100, s.length)]];
+    return [NSString stringWithFormat:@"%luB <非UTF8: %@>", (unsigned long)d.length,
+            [d subdataWithRange:NSMakeRange(0, MIN(16u, (unsigned)d.length))]];
 }
 
-static OSStatus WriteKeychain(NSString *svc, NSString *acc, NSData *payload) {
+static OSStatus WriteKC(NSString *svc, NSString *acc, NSData *p) {
     SecItemDelete((__bridge CFDictionaryRef)Q(svc, acc));
-    NSMutableDictionary *add = [Q(svc, acc) mutableCopy];
-    add[(__bridge id)kSecValueData] = payload;
-    add[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
-    return SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    NSMutableDictionary *a = [Q(svc, acc) mutableCopy];
+    a[(__bridge id)kSecValueData] = p;
+    a[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+    return SecItemAdd((__bridge CFDictionaryRef)a, NULL);
 }
 
-#pragma mark - GOT hook
+#pragma mark - hook
 
 typedef OSStatus (*CopyMatchingFn)(CFDictionaryRef, CFTypeRef *);
-static CopyMatchingFn g_origCopy = NULL;
+static CopyMatchingFn g_orig = NULL;
 static NSData *g_payload = nil;
-static int g_hitCount = 0;
-static NSString *g_lastQuery = @"(未拦截到任何查询)";
+static int g_hits = 0;
 
-static BOOL LooksLikeMember(NSString *acc) {
-    if (!acc) return NO;
-    NSString *low = acc.lowercaseString;
-    return [low containsString:@"transaction"] || [low containsString:@"member"] ||
-           [low containsString:@"vip"] || [low containsString:@"valid"];
-}
-
-static OSStatus MB_CopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    if (query) {
-        NSDictionary *d = (__bridge NSDictionary *)query;
+static OSStatus MB_Copy(CFDictionaryRef q, CFTypeRef *r) {
+    if (q && g_payload) {
+        NSDictionary *d = (__bridge NSDictionary *)q;
         NSString *acc = d[(__bridge id)kSecAttrAccount];
-        NSString *svc = d[(__bridge id)kSecAttrService];
         BOOL wantData = [d[(__bridge id)kSecReturnData] boolValue];
-
-        if ([acc isKindOfClass:[NSString class]] && LooksLikeMember(acc)) {
-            g_lastQuery = [NSString stringWithFormat:@"svc=%@ acc=%@ wantData=%d",
-                           svc, acc, wantData];
-            if (wantData && g_payload) {
-                g_hitCount++;
-                if (result) *result = CFBridgingRetain(g_payload);
-                return errSecSuccess;
-            }
+        if ([acc isKindOfClass:[NSString class]] && wantData &&
+            ([acc.lowercaseString containsString:@"transaction"] ||
+             [acc.lowercaseString containsString:@"member"])) {
+            g_hits++;
+            if (r) *r = CFBridgingRetain(g_payload);
+            return errSecSuccess;
         }
     }
-    return g_origCopy ? g_origCopy(query, result) : (OSStatus)errSecItemNotFound;
+    return g_orig ? g_orig(q, r) : (OSStatus)errSecItemNotFound;
 }
 
 static void PatchGOT(const char *sym, void *repl, void **origOut) {
@@ -96,9 +89,7 @@ static void PatchGOT(const char *sym, void *repl, void **origOut) {
         const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
         const char *img = _dyld_get_image_name(i);
-        if (!img) continue;
-        if (!strstr(img, "mangaCapsule") && !strstr(img, "MemberBypass")) continue;
-
+        if (!img || (!strstr(img, "mangaCapsule") && !strstr(img, "MemberBypass"))) continue;
         const struct load_command *lc =
             (const struct load_command *)((const char *)h + sizeof(struct mach_header_64));
         for (uint32_t c = 0; c < h->ncmds; c++) {
@@ -108,8 +99,7 @@ static void PatchGOT(const char *sym, void *repl, void **origOut) {
                     const struct section_64 *s =
                         (const struct section_64 *)((const char *)seg + sizeof(struct segment_command_64));
                     for (uint32_t j = 0; j < seg->nsects; j++, s++) {
-                        if (strcmp(s->sectname, "__got") &&
-                            strcmp(s->sectname, "__auth_got") &&
+                        if (strcmp(s->sectname, "__got") && strcmp(s->sectname, "__auth_got") &&
                             strcmp(s->sectname, "__la_symbol_ptr")) continue;
                         void **slots = (void **)((char *)h + s->offset);
                         for (uint32_t k = 0; k < s->size / sizeof(void *); k++) {
@@ -131,29 +121,91 @@ static void PatchGOT(const char *sym, void *repl, void **origOut) {
     ADD(@"hook %s: %d 处", sym, n);
 }
 
-#pragma mark - 弹窗
+#pragma mark - 正确的取窗口（iOS 13+）
 
-static void ShowAlert(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIWindow *win = nil;
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            if (w.isKeyWindow) { win = w; break; }
+static UIWindow *MBKeyWindow(void) {
+    UIWindow *fallback = nil;
+
+    // 1) connectedScenes 路线
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) return w;
+                if (!fallback) fallback = w;
+            }
+            if (!fallback && ws.windows.count) fallback = ws.windows.firstObject;
         }
-        if (!win) win = [UIApplication sharedApplication].windows.firstObject;
-        if (!win) { NSLog(@"[MB] no window"); return; }
+    }
 
-        NSString *body = [g_lines componentsJoinedByString:@"\n"];
-        UIAlertController *ac =
-            [UIAlertController alertControllerWithTitle:@"MemberBypass 诊断"
-                                                message:body
-                                         preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"知道了"
-                                               style:UIAlertActionStyleDefault
-                                             handler:nil]];
-        [win.rootViewController presentViewController:ac animated:YES completion:nil];
-        NSLog(@"[MB] alert shown");
-    });
+    // 2) 老 API
+    if (!fallback) {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) return w;
+            if (!fallback) fallback = w;
+        }
+    }
+
+    // 3) 都空：手工建一个
+    if (!fallback && @available(iOS 13.0, *)) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)sc;
+            UIWindow *w = [[UIWindow alloc] initWithWindowScene:ws];
+            w.windowLevel = UIWindowLevelAlert + 1;
+            w.frame = ws.coordinateSpace.bounds;
+            w.hidden = NO;
+            w.rootViewController = [[UIViewController alloc] init];
+            fallback = w;
+            ADD(@"(手工创建 window)");
+            break;
+        }
+    }
+    return fallback;
+}
+
+static void ShowAlert(int attempt) {
+    UIWindow *win = MBKeyWindow();
+    UIViewController *root = win.rootViewController;
+
+    if (!root) {
+        if (attempt < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ ShowAlert(attempt + 1); });
+        }
+        return;
+    }
+
+    // root 可能已经 present 了别的东西，逐层找最顶层
+    UIViewController *top = root;
+    while (top.presentedViewController) top = top.presentedViewController;
+
+    NSString *body = [g_lines componentsJoinedByString:@"\n"];
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:@"MemberBypass 诊断"
+                                            message:body
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                           style:UIAlertActionStyleDefault
+                                         handler:nil]];
+
+    [top presentViewController:ac animated:YES completion:^{
+        NSLog(@"[MB] alert presented");
+    }];
+    NSLog(@"[MB] alert attempted on %@", NSStringFromClass([top class]));
+}
+
+#pragma mark - 落盘兜底
+
+static void DumpToFile(void) {
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES) firstObject];
+    if (!dir) return;
+    NSString *p = [dir stringByAppendingPathComponent:@"mb.log"];
+    NSString *txt = [g_lines componentsJoinedByString:@"\n"];
+    [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"[MB] log -> %@", p);
 }
 
 #pragma mark - init
@@ -163,10 +215,10 @@ static void MBInitOnce(void) {
     g_done = YES;
     g_lines = [NSMutableArray array];
 
-    ADD(@"dylib 已加载 ✓");
+    ADD(@"✅ dylib 已加载");
     ADD(@"bundle: %@", [[NSBundle mainBundle] bundleIdentifier]);
+    ADD(@"iOS: %@", [[UIDevice currentDevice] systemVersion]);
 
-    // 造 payload
     NSMutableDictionary *p = [NSMutableDictionary dictionary];
     p[@"id"] = @"local";
     p[@"isVIP"] = @YES;
@@ -177,27 +229,28 @@ static void MBInitOnce(void) {
     p[@"weeklyReadNum"] = @0;
     g_payload = [NSJSONSerialization dataWithJSONObject:p options:0 error:nil];
 
-    // 读原始值
-    ADD(@"原始 validTransaction:");
-    ADD(@"  %@", ReadKeychain(@"rainy.lyn.mangaCapsule", @"validTransaction"));
+    ADD(@"");
+    ADD(@"原始 Keychain:");
+    ADD(@" rainy.lyn.mangaCapsule:");
+    ADD(@"   %@", ReadKC(@"rainy.lyn.mangaCapsule", @"validTransaction"));
 
-    // 写入
-    OSStatus w1 = WriteKeychain(@"rainy.lyn.mangaCapsule", @"validTransaction", g_payload);
-    OSStatus w2 = WriteKeychain(@"rainy.heichai.mangaCapsule3", @"validTransaction", g_payload);
-    ADD(@"写入 status: %d / %d", (int)w1, (int)w2);
-    if (w1 == -34018 || w2 == -34018) {
-        ADD(@"⚠️ -34018 缺 keychain entitlement");
-    }
+    OSStatus w1 = WriteKC(@"rainy.lyn.mangaCapsule", @"validTransaction", g_payload);
+    OSStatus w2 = WriteKC(@"rainy.heichai.mangaCapsule3", @"validTransaction", g_payload);
+    ADD(@"");
+    ADD(@"写入: %d / %d", (int)w1, (int)w2);
+    if (w1 == -34018 || w2 == -34018) ADD(@"⚠️ -34018 无 keychain 权限");
 
-    // 回读确认
     ADD(@"写入后读回:");
-    ADD(@"  %@", ReadKeychain(@"rainy.lyn.mangaCapsule", @"validTransaction"));
+    ADD(@"   %@", ReadKC(@"rainy.lyn.mangaCapsule", @"validTransaction"));
 
-    // 装 hook
-    PatchGOT("SecItemCopyMatching", (void *)MB_CopyMatching, (void **)&g_origCopy);
-    if (!g_origCopy) g_origCopy = (CopyMatchingFn)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
+    PatchGOT("SecItemCopyMatching", (void *)MB_Copy, (void **)&g_orig);
+    if (!g_orig) g_orig = (CopyMatchingFn)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
 
-    ShowAlert();
+    DumpToFile();
+
+    // app 启动需要时间，延迟弹
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ ShowAlert(0); });
 }
 
 __attribute__((used, visibility("default")))
