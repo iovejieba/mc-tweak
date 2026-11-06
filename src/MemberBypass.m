@@ -195,8 +195,9 @@ static void PatchGOT(const char *sym, void *replacement, void **origOut) {
 
 #pragma mark - entry
 
-__attribute__((constructor))
-static void MBInit(void) {
+// 显式导出，配合链接器 -init 保证一定被调用
+__attribute__((used, visibility("default")))
+void MBInit(void) {
     @autoreleasepool {
         g_payload = BuildPayload();
         if (!g_payload) return;

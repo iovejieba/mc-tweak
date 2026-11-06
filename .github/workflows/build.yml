@@ -14,20 +14,13 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld llvm wget unzip xz-utils file cmake ninja-build
-
-      - name: Verify lld
-        run: |
-          which ld64.lld ld.lld lld || true
-          ld64.lld --version || ld64.lld -v || true
-          ls /usr/lib/llvm-*/bin/ | grep -i lld | head
+          sudo apt-get install -y -qq clang lld llvm wget unzip xz-utils file
 
       - name: Fetch iOS SDK (iPhoneOS16.5)
         run: |
           set -eux
           wget -q "https://github.com/theos/sdks/archive/refs/heads/master.zip" -O sdk.zip
           unzip -q sdk.zip
-          ls -d sdks-master/iPhoneOS*.sdk
           SDK=$(ls -d sdks-master/iPhoneOS16.5.sdk)
           echo "SDK=$PWD/$SDK" >> $GITHUB_ENV
           test -d "$SDK/usr/include"
@@ -35,20 +28,46 @@ jobs:
       - name: Compile MemberBypass
         run: |
           set -eux
-          export LD64_LLD=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
-          echo "using $LD64_LLD"
+          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
+          echo "LD64=$LD64"
+          cat > link.sh <<'EOS'
+          #!/bin/bash
+          set -eu
+          exec "$LD64" "$@"
+          EOS
+          chmod +x link.sh
+          export LD64
           clang -arch arm64 -target arm64-apple-ios16.0 \
             -isysroot "$SDK" \
-            -F"$SDK/System/Library/Frameworks" \
             -dynamiclib -fobjc-arc -O2 \
-            -fuse-ld="$LD64_LLD" \
+            -fuse-ld="$PWD/link.sh" \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-platform_version,ios,16.0,16.0 \
+            -Wl,-init,_MBInit \
             -framework Foundation -framework Security \
             -o MemberBypass.dylib \
             src/MemberBypass.m
           file MemberBypass.dylib
           ls -la MemberBypass.dylib
+
+      - name: Verify structure
+        run: |
+          set -eux
+          pip install --quiet lief || true
+          python - <<'EOF'
+import lief, sys
+b = lief.parse('MemberBypass.dylib')
+sects = [s.name for s in b.sections]
+print("sections:", sects)
+print("libraries:", [l.name for l in b.libraries])
+ok = True
+if '__mod_init_func' not in sects:
+    print("WARN: no __mod_init_func — -init must be present")
+    cmds = [c.command.name for c in b.commands]
+    print("has LC_ROUTINES_64:", any('ROUTINES' in c for c in cmds))
+for need in ('_MBInit',):
+    print(need, "exported:", need in b.exported_symbols)
+EOF
 
       - name: Upload
         if: always()
