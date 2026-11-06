@@ -64,6 +64,13 @@ jobs:
           clang -arch arm64 -target arm64-apple-ios16.0             -isysroot "$SDK"             -dynamiclib -fobjc-arc -O2             -fuse-ld="$LD64"             -Wl,-undefined,dynamic_lookup             -Wl,-platform_version,ios,16.0,16.0             -framework Foundation -framework UIKit             -o Probe.dylib             src/Probe.m || true
           file Probe.dylib || true
 
+      - name: Build Probe2
+        run: |
+          set -eux
+          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
+          clang -arch arm64 -target arm64-apple-ios16.0             -isysroot "$SDK"             -dynamiclib -fobjc-arc -O2             -fuse-ld="$LD64"             -Wl,-undefined,dynamic_lookup             -Wl,-platform_version,ios,16.0,16.0             -framework Foundation -framework UIKit -framework Security             -o Probe2.dylib             src/Probe2.m
+          file Probe2.dylib
+
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
@@ -73,5 +80,6 @@ jobs:
             MemberBypass.dylib
             Tracer.dylib
             Probe.dylib
+            Probe2.dylib
           retention-days: 7
           if-no-files-found: warn
