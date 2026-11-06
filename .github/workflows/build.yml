@@ -39,7 +39,7 @@ jobs:
             -Wl,-platform_version,ios,16.0,16.0 \
             -framework Foundation -framework Security \
             -o MemberBypass.dylib \
-            src/MemberBypass.m
+            src/MemberBypass.m src/Constructor.c
           file MemberBypass.dylib
           ls -la MemberBypass.dylib
 
