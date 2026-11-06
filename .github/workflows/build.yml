@@ -16,58 +16,37 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld llvm wget unzip xz-utils file
 
-      - name: Fetch iOS SDK (iPhoneOS16.5)
+      - name: Fetch iOS SDK
         run: |
           set -eux
           wget -q "https://github.com/theos/sdks/archive/refs/heads/master.zip" -O sdk.zip
           unzip -q sdk.zip
-          SDK=$(ls -d sdks-master/iPhoneOS16.5.sdk)
-          echo "SDK=$PWD/$SDK" >> $GITHUB_ENV
+          SDK="$PWD/sdks-master/iPhoneOS16.5.sdk"
           test -d "$SDK/usr/include"
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
 
-      - name: Compile MemberBypass
+      - name: Build dylib
         run: |
           set -eux
           LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
-          echo "LD64=$LD64"
-          cat > link.sh <<'EOS'
-          #!/bin/bash
-          set -eu
-          exec "$LD64" "$@"
-          EOS
-          chmod +x link.sh
-          export LD64
+          printf '#!/bin/bash\nexec %s "$@"\n' "$LD64" > /tmp/ld64wrap
+          chmod +x /tmp/ld64wrap
           clang -arch arm64 -target arm64-apple-ios16.0 \
             -isysroot "$SDK" \
             -dynamiclib -fobjc-arc -O2 \
-            -fuse-ld="$PWD/link.sh" \
+            -fuse-ld=/tmp/ld64wrap \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-platform_version,ios,16.0,16.0 \
-            -Wl,-init,_MBInit \
             -framework Foundation -framework Security \
             -o MemberBypass.dylib \
             src/MemberBypass.m
           file MemberBypass.dylib
           ls -la MemberBypass.dylib
 
-      - name: Verify structure
+      - name: Check dylib
         run: |
-          set -eux
-          pip install --quiet lief || true
-          python - <<'EOF'
-import lief, sys
-b = lief.parse('MemberBypass.dylib')
-sects = [s.name for s in b.sections]
-print("sections:", sects)
-print("libraries:", [l.name for l in b.libraries])
-ok = True
-if '__mod_init_func' not in sects:
-    print("WARN: no __mod_init_func — -init must be present")
-    cmds = [c.command.name for c in b.commands]
-    print("has LC_ROUTINES_64:", any('ROUTINES' in c for c in cmds))
-for need in ('_MBInit',):
-    print(need, "exported:", need in b.exported_symbols)
-EOF
+          pip install --quiet lief
+          python3 check_dylib.py MemberBypass.dylib
 
       - name: Upload
         if: always()
