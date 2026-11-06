@@ -57,9 +57,9 @@ static NSString *DescribeQuery(CFDictionaryRef q) {
     NSMutableArray *parts = [NSMutableArray array];
     for (id k in d) {
         NSString *key = [k description];
-        NSString *short = key;
+        NSString *shortKey = key;
         // 只保留可读部分：kSecAttrService -> svce 之类
-        if ([key hasPrefix:@"kSec"]) short = [key substringFromIndex:4];
+        if ([key hasPrefix:@"kSec"]) shortKey = [key substringFromIndex:4];
         id v = d[k];
         NSString *vs;
         if ([v isKindOfClass:[NSData class]]) {
@@ -69,7 +69,7 @@ static NSString *DescribeQuery(CFDictionaryRef q) {
         } else {
             vs = [v description];
         }
-        [parts addObject:[NSString stringWithFormat:@"%@=%@", short, vs]];
+        [parts addObject:[NSString stringWithFormat:@"%@=%@", shortKey, vs]];
     }
     return [parts componentsJoinedByString:@", "];
 }
