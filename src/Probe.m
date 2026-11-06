@@ -10,6 +10,7 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #include <string.h>
+#include <dlfcn.h>
 
 static NSMutableArray<NSString *> *L = nil;
 #define ADD(fmt, ...) [L addObject:[NSString stringWithFormat:(fmt), ##__VA_ARGS__]]
@@ -84,15 +85,6 @@ static void ProbeInit(void) {
             ADD(@"");
             ADD(@"=== MemberService 探查 ===");
             // qword_1010C6658 是单例指针，基址 0x100000000
-            Dl_info info;
-            const char *img = NULL;
-            for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-                const char *nm = _dyld_get_image_name(i);
-                if (nm && strstr(nm, "mangaCapsule")) { img = nm; break; }
-            }
-            if (img && dladdr((void *)0x100000000ULL, &info)) {
-                // 用 slide 计算
-            }
             intptr_t slide = 0;
             for (uint32_t i = 0; i < _dyld_image_count(); i++) {
                 const char *nm = _dyld_get_image_name(i);
