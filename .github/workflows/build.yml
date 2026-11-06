@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=16.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 \
+            -framework Foundation -framework Security \
+            -o MemberBypass.dylib \
+            src/MemberBypass.m
+          lipo -archs MemberBypass.dylib
+          ls -la MemberBypass.dylib
+
+      - name: Codesign (ad-hoc for ldid later)
+        run: |
+          codesign -f -s - MemberBypass.dylib || true
+          file MemberBypass.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MemberBypass-dylib
+          path: MemberBypass.dylib
+          retention-days: 7
