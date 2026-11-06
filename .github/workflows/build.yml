@@ -11,43 +11,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cross toolchain
+      - name: Install toolchain
         run: |
-          set -eux
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang cmake ninja-build libxml2-dev \
-            libssl-dev zlib1g-dev xz-utils wget unzip
+          sudo apt-get install -y -qq clang wget unzip xz-utils file
 
-      - name: Download iOS SDK (iPhoneOS15.5.sdk)
+      - name: Fetch iOS SDK
         run: |
           set -eux
-          # cctools-port 的预置 SDK；体积约 100MB
-          wget -q "https://github.com/xybp888/iOS-SDKs/raw/master/iPhoneOS15.5.sdk.zip" -O sdk.zip || \
           wget -q "https://github.com/theos/sdks/archive/refs/heads/master.zip" -O sdk.zip
           unzip -q sdk.zip
-          ls -d *.sdk
+          ls -d sdks-master/*.sdk
+          SDK=$(ls -d sdks-master/*.sdk | head -1)
+          echo "SDK=$PWD/$SDK" >> $GITHUB_ENV
+          du -sh "$SDK"
 
-      - name: Show SDK
-        run: |
-          set -eux
-          SDK=$(ls -d *.sdk | head -1)
-          echo "SDK=$SDK"
-          echo "SDK=$(pwd)/$SDK" >> $GITHUB_ENV
-          ls "$SDK" | head
-
-      - name: Build dylib (arm64)
+      - name: Build dylib
         run: |
           set -eux
           clang --version
-          clang -arch arm64 \
-            -target arm64-apple-ios16.0 \
+          ls "$SDK/System/Library/Frameworks" | head -20
+
+      - name: Compile MemberBypass
+        run: |
+          set -eux
+          clang -arch arm64 -target arm64-apple-ios16.0 \
             -isysroot "$SDK" \
             -F"$SDK/System/Library/Frameworks" \
             -dynamiclib -fobjc-arc -O2 \
+            -Wl,-undefined,dynamic_lookup \
             -framework Foundation -framework Security \
             -o MemberBypass.dylib \
-            src/MemberBypass.m || true
-          ls -la MemberBypass.dylib || echo "build failed"
+            src/MemberBypass.m
+          file MemberBypass.dylib
+          ls -la MemberBypass.dylib
 
       - name: Upload
         if: always()
