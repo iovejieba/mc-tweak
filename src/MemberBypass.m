@@ -1,11 +1,11 @@
-// MemberBypass.m v2 — 带自检日志 + 键名超集
+// MemberBypass.m v3 — 诊断优先
 //
-// v1 为什么可能无效：
-//  1) ld64.lld 生成的 __init_offsets 未必被 dyld 当成初始化表 → MBInit 没跑
-//     → 本版改为 ObjC +load（运行时必定调用）+ __mod_init_func 双保险
-//  2) MemberObj 的字段名带下划线（_isVIP/_expireAt/_VIPType…），Codable 键可能是
-//     _isVIP 而不是 isVIP → 本版把两套命名一起塞进 JSON（JSONDecoder 忽略未知键）
-//  3) 自签下 keychain 常报 -34018 → 本版把 SecItemAdd 的返回码写进日志
+// v1/v2 都无效，说明我对 keychain 键名的假设可能是错的。
+// v3 策略：不再猜，先把 app 实际调用的 keychain 查询全部记下来，
+//          命中我们的 key 再返回伪造值，同时写入磁盘日志方便导出。
+//
+// 日志位置：<App沙盒>/Documents/mb.log
+// 越狱机路径：/var/mobile/Containers/Data/Application/<UUID>/Documents/mb.log
 
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
@@ -16,135 +16,102 @@
 #import <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
-// 2286-11-21 UTC，2001 纪元秒
-static const double kExpire = 9021715200.0;
-// VIPType 取值（Int 背书的 enum，先试 2）
+static const double kExpire = 9021715200.0;   // 2286-11-21 UTC
 static const int    kVIPInt = 2;
 
-static NSString *const kSvc = @"rainy.lyn.mangaCapsule";
-static NSString *const kAcc = @"validTransaction";
-
-static BOOL  g_done = NO;
-static FILE *g_log  = NULL;
+static BOOL    g_done = NO;
+static FILE   *g_log  = NULL;
 static NSData *g_payload = nil;
+static int     g_queries = 0;
 
 #pragma mark - 日志
 
 static void MBOpenLog(void) {
     if (g_log) return;
-    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES) firstObject];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
+                              withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *p = [dir stringByAppendingPathComponent:@"mb.log"];
     g_log = fopen(p.UTF8String, "a");
     if (g_log) {
-        fprintf(g_log, "\n===== MemberBypass v2 start (pid %d) =====\n", getpid());
+        fprintf(g_log, "\n===== MemberBypass v3 (pid %d) =====\n", getpid());
         fflush(g_log);
     }
 }
 
 static void MBLog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    va_list ap; va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[MB] %@", s);
-    if (g_log) {
-        fprintf(g_log, "%s\n", s.UTF8String);
-        fflush(g_log);
-    }
+    if (g_log) { fprintf(g_log, "%s\n", s.UTF8String); fflush(g_log); }
 }
 
-#pragma mark - payload（键名超集）
+// 把一个 CFDictionary 查询压成一行可读文本
+static NSString *DescribeQuery(CFDictionaryRef q) {
+    if (!q) return @"<nil>";
+    NSDictionary *d = (__bridge NSDictionary *)q;
+    NSMutableArray *parts = [NSMutableArray array];
+    for (id k in d) {
+        NSString *key = [k description];
+        NSString *short = key;
+        // 只保留可读部分：kSecAttrService -> svce 之类
+        if ([key hasPrefix:@"kSec"]) short = [key substringFromIndex:4];
+        id v = d[k];
+        NSString *vs;
+        if ([v isKindOfClass:[NSData class]]) {
+            vs = [NSString stringWithFormat:@"<Data %luB>", (unsigned long)[v length]];
+        } else if ([v isKindOfClass:[NSString class]]) {
+            vs = v;
+        } else {
+            vs = [v description];
+        }
+        [parts addObject:[NSString stringWithFormat:@"%@=%@", short, vs]];
+    }
+    return [parts componentsJoinedByString:@", "];
+}
+
+#pragma mark - payload
 
 static NSData *BuildPayload(void) {
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
-
-    // id
     d[@"id"]     = @"local";
     d[@"ID"]     = @1;
-
-    // isVIP：三种可能命名
     d[@"isVIP"]  = @YES;
     d[@"_isVIP"] = @YES;
     d[@"isVip"]  = @YES;
     d[@"isMember"] = @YES;
-
-    // expireAt
-    d[@"expireAt"]  = @(kExpire);
-    d[@"_expireAt"] = @(kExpire);
-    d[@"ExpireAt"]  = @(kExpire);
-    d[@"vipExpireAt"] = @(kExpire);
-
-    // VIPType：两套命名都给 Int，避免 String/Int 冲突
-    d[@"VIPType"]  = @(kVIPInt);
-    d[@"_VIPType"] = @(kVIPInt);
-    d[@"vipType"]  = @(kVIPInt);
-    d[@"productType"] = @(kVIPInt);
-
-    // 其余字段
+    d[@"expireAt"]   = @(kExpire);
+    d[@"_expireAt"]  = @(kExpire);
+    d[@"ExpireAt"]   = @(kExpire);
+    d[@"VIPType"]    = @(kVIPInt);
+    d[@"_VIPType"]   = @(kVIPInt);
+    d[@"vipType"]    = @(kVIPInt);
     d[@"hasGifted"]             = @NO;
     d[@"_hasGifted"]            = @NO;
     d[@"shouldRefreshProducts"]  = @NO;
     d[@"_shouldRefreshProducts"] = @NO;
     d[@"weeklyReadNum"]  = @0;
     d[@"_weeklyReadNum"] = @0;
-
-    NSError *err = nil;
-    NSData *out = [NSJSONSerialization dataWithJSONObject:d options:0 error:&err];
-    if (err) MBLog(@"payload build err: %@", err);
-    return out;
+    return [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
 }
 
-#pragma mark - keychain 读写
+#pragma mark - 动态决定 target key
+// v3 不再硬编码 service/account：拦截所有查询并记录，
+// 一旦发现形如 validTransaction / member / vip 的 account，就把它当作目标。
 
-static NSDictionary *BaseQuery(void) {
-    return @{
-        (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: kSvc,
-        (__bridge id)kSecAttrAccount: kAcc,
-    };
-}
+static NSMutableSet<NSString *> *g_seenAccounts = nil;
 
-static OSStatus WriteKeychain(NSData *payload) {
-    NSDictionary *q = BaseQuery();
-    OSStatus delSt = SecItemDelete((__bridge CFDictionaryRef)q);
-
-    NSMutableDictionary *add = [q mutableCopy];
-    add[(__bridge id)kSecValueData]          = payload;
-    add[(__bridge id)kSecAttrAccessible]     = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
-    add[(__bridge id)kSecAttrSynchronizable] = @NO;
-    OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
-
-    MBLog(@"keychain: delete=%d add=%d len=%lu", (int)delSt, (int)st,
-          (unsigned long)payload.length);
-    if (st == -34018) {
-        MBLog(@"keychain -34018 = 缺 keychain-access-groups entitlement，改走 hook 路径");
-    }
-    return st;
-}
-
-// 把当前 keychain 里这条记录读出来（不经过我们的 hook）
-static void DumpKeychain(void) {
-    NSMutableDictionary *q = [BaseQuery() mutableCopy];
-    q[(__bridge id)kSecReturnData]       = @YES;
-    q[(__bridge id)kSecMatchLimit]       = (__bridge id)kSecMatchLimitOne;
-    CFTypeRef out = NULL;
-    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &out);
-    if (st == errSecSuccess && out) {
-        NSData *d = (__bridge_transfer NSData *)out;
-        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-        MBLog(@"keychain 现有值(%lu B): %@", (unsigned long)d.length,
-              s.length ? s : @"<非UTF8，可能是 NSKeyedArchiver>");
-        if (!s.length) {
-            MBLog(@"  头 32 字节: %@", [d subdataWithRange:NSMakeRange(0, MIN(32u, (unsigned)d.length))]);
-        }
-    } else {
-        MBLog(@"keychain 当前无值 (status=%d)", (int)st);
-    }
+static BOOL AccountLooksInteresting(NSString *acc) {
+    if (!acc) return NO;
+    NSString *low = acc.lowercaseString;
+    return [low containsString:@"transaction"] ||
+           [low containsString:@"member"] ||
+           [low containsString:@"vip"] ||
+           [low containsString:@"valid"];
 }
 
 #pragma mark - hook
@@ -155,51 +122,47 @@ typedef OSStatus (*AddFn)(CFDictionaryRef, CFTypeRef *);
 static CopyMatchingFn g_origCopy = NULL;
 static AddFn           g_origAdd  = NULL;
 
-static BOOL QueryIsOurs(CFDictionaryRef q) {
-    if (!q) return NO;
-    NSDictionary *d = (__bridge NSDictionary *)q;
-    id acc = d[(__bridge id)kSecAttrAccount];
-    if (![acc isKindOfClass:[NSString class]] || ![acc isEqualToString:kAcc]) return NO;
-    id svc = d[(__bridge id)kSecAttrService];
-    if (svc == nil) return YES;
-    if (![svc isKindOfClass:[NSString class]]) return NO;
-    return [svc isEqualToString:kSvc];
-}
-
 static OSStatus MB_CopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    g_queries++;
     NSDictionary *qd = (__bridge NSDictionary *)query;
-    BOOL ours = QueryIsOurs(query);
-    BOOL wantData  = [qd[(__bridge id)kSecReturnData] boolValue];
-    BOOL wantAttrs = [qd[(__bridge id)kSecReturnAttributes] boolValue];
+    NSString *acc = qd[(__bridge id)kSecAttrAccount];
+    NSString *svc = qd[(__bridge id)kSecAttrService];
+    BOOL wantData = [qd[(__bridge id)kSecReturnData] boolValue];
     id limit = qd[(__bridge id)kSecMatchLimit];
     BOOL all = [limit isEqual:(__bridge id)kSecMatchLimitAll];
 
-    if (ours && !all) {
-        MBLog(@"hit CopyMatching (data=%d attrs=%d) -> 返回伪造值", wantData, wantAttrs);
-        if (wantAttrs && !wantData) {
-            return g_origCopy ? g_origCopy(query, result) : (OSStatus)errSecItemNotFound;
-        }
-        if (result && g_payload) {
-            *result = CFBridgingRetain(g_payload);
-        }
+    // 前 200 次全记，避免日志爆掉
+    if (g_queries <= 200) {
+        MBLog(@"Q#%d %@", g_queries, DescribeQuery(query));
+    }
+
+    if ([acc isKindOfClass:[NSString class]]) {
+        if (!g_seenAccounts) g_seenAccounts = [NSMutableSet set];
+        [g_seenAccounts addObject:acc];
+    }
+
+    BOOL target = AccountLooksInteresting(acc) && wantData && !all;
+
+    if (target && g_payload) {
+        MBLog(@"** 命中疑似会员项 acc=%@ svc=%@ -> 返回伪造", acc, svc);
+        if (result) *result = CFBridgingRetain(g_payload);
         return errSecSuccess;
     }
 
-    if (ours && all) {
-        MBLog(@"hit CopyMatching with MatchLimitAll，放行原逻辑");
+    OSStatus st = g_origCopy ? g_origCopy(query, result) : (OSStatus)errSecItemNotFound;
+    if (target) {
+        MBLog(@"   但未命中（st=%d）", (int)st);
     }
-    if (g_origCopy) return g_origCopy(query, result);
-    return (OSStatus)errSecItemNotFound;
+    return st;
 }
 
 static OSStatus MB_Add(CFDictionaryRef attrs, CFTypeRef *out) {
     OSStatus st = g_origAdd ? g_origAdd(attrs, out) : (OSStatus)errSecParam;
     if (attrs) {
         NSDictionary *d = (__bridge NSDictionary *)attrs;
-        id acc = d[(__bridge id)kSecAttrAccount];
-        if ([acc isKindOfClass:[NSString class]] && [acc isEqualToString:kAcc]) {
-            MBLog(@"SecItemAdd 动了我们的 key (st=%d) -> 回写", (int)st);
-            WriteKeychain(g_payload);
+        NSString *acc = d[(__bridge id)kSecAttrAccount];
+        if ([acc isKindOfClass:[NSString class]] && AccountLooksInteresting(acc)) {
+            MBLog(@"SecItemAdd 写入 %@ (st=%d)", acc, (int)st);
         }
     }
     return st;
@@ -217,9 +180,7 @@ static void PatchGOT(const char *sym, void *repl, void **origOut) {
         if (!h || h->magic != MH_MAGIC_64) continue;
         const char *img = _dyld_get_image_name(i);
         if (!img) continue;
-        BOOL isApp = strstr(img, "mangaCapsule") != NULL;
-        BOOL isSelf = strstr(img, "MemberBypass") != NULL;
-        if (!isApp && !isSelf) continue;
+        if (!strstr(img, "mangaCapsule") && !strstr(img, "MemberBypass")) continue;
 
         const struct load_command *lc =
             (const struct load_command *)((const char *)h + sizeof(struct mach_header_64));
@@ -237,11 +198,10 @@ static void PatchGOT(const char *sym, void *repl, void **origOut) {
                         uint32_t n = s->size / sizeof(void *);
                         for (uint32_t k = 0; k < n; k++) {
                             if (slots[k] != real) continue;
-                            kern_return_t kr = vm_protect(mach_task_self(),
-                                                          (vm_address_t)&slots[k],
-                                                          sizeof(void *), false,
-                                                          VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                            if (kr != KERN_SUCCESS) { MBLog(@"vm_protect 失败 %d", kr); continue; }
+                            if (vm_protect(mach_task_self(), (vm_address_t)&slots[k],
+                                           sizeof(void *), false,
+                                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS)
+                                continue;
                             if (origOut && !*origOut) *origOut = slots[k];
                             slots[k] = repl;
                             patched++;
@@ -262,37 +222,45 @@ static void MBInitOnce(void) {
     g_done = YES;
 
     MBOpenLog();
-    MBLog(@"===== MBInit 进入（说明 dylib 已加载且初始化被调用）=====");
-    MBLog(@"bundle=%@ ver=%@", [[NSBundle mainBundle] bundleIdentifier],
-          [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"]);
+    MBLog(@"===== v3 启动：dylib 已加载，初始化已执行 =====");
+    MBLog(@"bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
 
     g_payload = BuildPayload();
-    if (!g_payload) { MBLog(@"payload 构建失败"); return; }
-    MBLog(@"payload = %@", [[NSString alloc] initWithData:g_payload encoding:NSUTF8StringEncoding]);
 
-    // 先看原始状态，便于对比
-    DumpKeychain();
-
-    // 1) 直接写
-    WriteKeychain(g_payload);
-    DumpKeychain();
-
-    // 2) hook 读
+    // 先装 hook，再写 keychain，这样写入也能被自己看到
     PatchGOT("SecItemCopyMatching", (void *)MB_CopyMatching, (void **)&g_origCopy);
     if (!g_origCopy) g_origCopy = (CopyMatchingFn)dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
-
-    // 3) hook 写
     PatchGOT("SecItemAdd", (void *)MB_Add, (void **)&g_origAdd);
     if (!g_origAdd) g_origAdd = (AddFn)dlsym(RTLD_DEFAULT, "SecItemAdd");
 
-    MBLog(@"origCopy=%p origAdd=%p —— init 完成", g_origCopy, g_origAdd);
+    // 主动写一份到最常见的两种 service
+    NSArray *svcs = @[@"rainy.lyn.mangaCapsule",
+                      @"rainy.heichai.mangaCapsule3",
+                      [[NSBundle mainBundle] bundleIdentifier]];
+    NSArray *accs = @[@"validTransaction"];
+    for (NSString *svc in svcs) {
+        if (!svc) continue;
+        for (NSString *acc in accs) {
+            NSDictionary *q = @{
+                (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+                (__bridge id)kSecAttrService: svc,
+                (__bridge id)kSecAttrAccount: acc,
+            };
+            SecItemDelete((__bridge CFDictionaryRef)q);
+            NSMutableDictionary *add = [q mutableCopy];
+            add[(__bridge id)kSecValueData] = g_payload;
+            add[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+            OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+            MBLog(@"写入 svc=%@ acc=%@ -> %d", svc, acc, (int)st);
+        }
+    }
+
+    MBLog(@"init 完成，开始观察 app 的 keychain 调用…");
 }
 
-// 双保险 1：显式导出，供 __mod_init_func 用
 __attribute__((used, visibility("default")))
 void MBInit(void) { MBInitOnce(); }
 
-// 双保险 2：ObjC +load —— 镜像加载后运行时必定调用，不依赖 __mod_init_func
 __attribute__((objc_root_class))
 @interface MBLoader
 @end
