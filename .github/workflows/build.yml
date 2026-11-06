@@ -38,9 +38,9 @@ jobs:
               -framework Foundation -framework UIKit -framework Security"
 
           # 驼峰键名
-          $CC -DVIPKEY_UNDERSCORE=0 -o MemberBypass_camel.dylib src/MemberBypass.m src/Constructor.c
+          $CC -o MemberBypass_camel.dylib src/MemberBypass.m
           # 下划线键名
-          $CC -DVIPKEY_UNDERSCORE=1 -o MemberBypass_uscore.dylib src/MemberBypass.m src/Constructor.c
+          $CC -o MemberBypass_uscore.dylib src/MemberBypass.m
 
           file MemberBypass_camel.dylib MemberBypass_uscore.dylib
           ls -la *.dylib
