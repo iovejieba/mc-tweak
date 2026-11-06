@@ -8,16 +8,20 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
       - name: Show toolchain
         run: |
-          xcodebuild -version
+          sw_vers
+          xcodebuild -version || true
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: Build dylib (arm64)
         run: |
+          set -eux
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun --sdk iphoneos clang \
             -arch arm64 \
@@ -30,12 +34,10 @@ jobs:
           lipo -archs MemberBypass.dylib
           ls -la MemberBypass.dylib
 
-      - name: Codesign (ad-hoc for ldid later)
-        run: |
-          codesign -f -s - MemberBypass.dylib || true
-          file MemberBypass.dylib
+      - name: Ad-hoc sign
+        run: codesign -f -s - MemberBypass.dylib || true
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: MemberBypass-dylib
