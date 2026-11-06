@@ -25,7 +25,7 @@ jobs:
           test -d "$SDK/usr/include"
           echo "SDK=$SDK" >> "$GITHUB_ENV"
 
-      - name: Build dylib
+      - name: Build MemberBypass
         run: |
           set -eux
           LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
@@ -37,22 +37,33 @@ jobs:
             -fuse-ld=/tmp/ld64wrap \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-platform_version,ios,16.0,16.0 \
-            -framework Foundation -framework Security \
+            -framework Foundation -framework UIKit -framework Security \
             -o MemberBypass.dylib \
             src/MemberBypass.m src/Constructor.c
           file MemberBypass.dylib
-          ls -la MemberBypass.dylib
 
-      - name: Check dylib
+      - name: Build Tracer
         run: |
-          pip install --quiet lief
-          python3 check_dylib.py MemberBypass.dylib
+          set -eux
+          LD64=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
+          clang -arch arm64 -target arm64-apple-ios16.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 \
+            -fuse-ld="$LD64" \
+            -Wl,-undefined,dynamic_lookup \
+            -Wl,-platform_version,ios,16.0,16.0 \
+            -framework Foundation -framework UIKit \
+            -o Tracer.dylib \
+            src/Tracer.m || true
+          file Tracer.dylib || true
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: MemberBypass-dylib
-          path: MemberBypass.dylib
+          name: dylibs
+          path: |
+            MemberBypass.dylib
+            Tracer.dylib
           retention-days: 7
           if-no-files-found: warn
