@@ -14,32 +14,36 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang wget unzip xz-utils file
+          sudo apt-get install -y -qq clang lld llvm wget unzip xz-utils file cmake ninja-build
 
-      - name: Fetch iOS SDK
+      - name: Verify lld
+        run: |
+          which ld64.lld ld.lld lld || true
+          ld64.lld --version || ld64.lld -v || true
+          ls /usr/lib/llvm-*/bin/ | grep -i lld | head
+
+      - name: Fetch iOS SDK (iPhoneOS16.5)
         run: |
           set -eux
           wget -q "https://github.com/theos/sdks/archive/refs/heads/master.zip" -O sdk.zip
           unzip -q sdk.zip
-          ls -d sdks-master/*.sdk
-          SDK=$(ls -d sdks-master/*.sdk | head -1)
+          ls -d sdks-master/iPhoneOS*.sdk
+          SDK=$(ls -d sdks-master/iPhoneOS16.5.sdk)
           echo "SDK=$PWD/$SDK" >> $GITHUB_ENV
-          du -sh "$SDK"
-
-      - name: Build dylib
-        run: |
-          set -eux
-          clang --version
-          ls "$SDK/System/Library/Frameworks" | head -20
+          test -d "$SDK/usr/include"
 
       - name: Compile MemberBypass
         run: |
           set -eux
+          export LD64_LLD=$(ls /usr/lib/llvm-*/bin/ld64.lld | head -1)
+          echo "using $LD64_LLD"
           clang -arch arm64 -target arm64-apple-ios16.0 \
             -isysroot "$SDK" \
             -F"$SDK/System/Library/Frameworks" \
             -dynamiclib -fobjc-arc -O2 \
+            -fuse-ld="$LD64_LLD" \
             -Wl,-undefined,dynamic_lookup \
+            -Wl,-platform_version,ios,16.0,16.0 \
             -framework Foundation -framework Security \
             -o MemberBypass.dylib \
             src/MemberBypass.m
